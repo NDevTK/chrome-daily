@@ -18,47 +18,52 @@ jobs:
           mkdir chromium_temp
           cd chromium_temp
           git init
-          
           git remote add upstream https://chromium.googlesource.com/chromium/src.git
           
-          # FIX 1: Fetch 48 hours instead of 24.
-          # This creates a buffer so the 24h cutoff isn't the "root" of the history.
-          echo "Fetching metadata..."
+          # Fetch 48 hours to ensure a valid history graph
           git fetch upstream main --filter=blob:none --shallow-since="48 hours ago"
 
       - name: Identify and Download Changed Files
         run: |
           cd chromium_temp
           
-          # List files changed in the last 24 hours
-          # --diff-filter=ACMRT excludes Deleted files (D)
-          # 'sort -u' ensures we don't download the same file twice if it changed multiple times
-          git log --since="24 hours ago" --pretty="" --name-only --diff-filter=ACMRT upstream/main | sort -u > changed_files_list.txt
+          # 1. Get raw list of all files touched in the last 24 hours
+          git log --since="24 hours ago" --pretty="" --name-only --diff-filter=ACMRT upstream/main | sort -u > raw_changes.txt
           
-          COUNT=$(wc -l < changed_files_list.txt)
-          echo "Found $COUNT files actually modified in the last 24 hours."
+          echo "Raw changed files count: $(wc -l < raw_changes.txt)"
           
-          if [ "$COUNT" -eq "0" ]; then
+          if [ ! -s raw_changes.txt ]; then
             echo "No changes found. Exiting."
             echo "NO_CHANGES=true" >> $GITHUB_ENV
             exit 0
           fi
           
-          # FIX 2: Removed the trailing "."
-          # We use xargs strictly to batch the arguments if the list is too massive, 
-          # though pathspec-from-file is usually safer.
-          # However, pathspec-from-file + restore can sometimes be tricky with large lists in partial clones.
-          # We will stick to pathspec-from-file but WITHOUT the trailing dot.
+          # 2. FILTER: Keep only files that actually exist in upstream/main
+          # We use xargs to pass the filenames to git ls-tree.
+          # git ls-tree only outputs files that exist, effectively filtering out the deleted ones.
+          # We use -r to recurse (though valid paths shouldn't need it, it's safer) and --name-only.
           
-          git restore --source=upstream/main --pathspec-from-file=changed_files_list.txt
+          cat raw_changes.txt | xargs -d '\n' git ls-tree -r --name-only upstream/main > valid_files.txt
+          
+          VALID_COUNT=$(wc -l < valid_files.txt)
+          echo "Files valid for download: $VALID_COUNT"
+          
+          if [ "$VALID_COUNT" -eq "0" ]; then
+             echo "All changed files were deleted. Nothing to download."
+             echo "NO_CHANGES=true" >> $GITHUB_ENV
+             exit 0
+          fi
+
+          # 3. Download only the verified existing files
+          git restore --source=upstream/main --pathspec-from-file=valid_files.txt
 
       - name: Prepare Staging Area
         if: env.NO_CHANGES != 'true'
         run: |
-          # Clean the current directory (remove old files)
+          # Clean current directory (remove yesterday's files)
           find . -maxdepth 1 -not -name '.git' -not -name '.github' -not -name 'chromium_temp' -exec rm -rf {} +
           
-          # Move files
+          # Move new files
           rsync -av --exclude='.git' chromium_temp/ .
           rm -rf chromium_temp
 
