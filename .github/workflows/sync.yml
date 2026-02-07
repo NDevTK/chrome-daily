@@ -1,0 +1,86 @@
+name: Daily Chromium Changed Files Only
+
+on:
+  schedule:
+    - cron: '0 0 * * *' # Runs daily at midnight UTC
+  workflow_dispatch:
+
+jobs:
+  extract-and-push:
+    runs-on: ubuntu-latest
+    
+    steps:
+      # 1. Checkout the target repo (where we will push the result)
+      - name: Checkout Target Repository
+        uses: actions/checkout@v4
+
+      # 2. Setup a separate temp directory for Chromium operations
+      # We do this to avoid mixing Chromium git history with your repo's history
+      - name: Fetch Chromium Changes (Metadata Only)
+        run: |
+          mkdir chromium_temp
+          cd chromium_temp
+          git init
+          
+          # Add the remote
+          git remote add upstream https://chromium.googlesource.com/chromium/src.git
+          
+          # TRICK: fetch only commits from the last 24h, ignoring file contents (blobs)
+          # This keeps the download small (MBs instead of GBs)
+          echo "Fetching metadata..."
+          git fetch upstream main --filter=blob:none --shallow-since="24 hours ago"
+
+      # 3. Identify and Download ONLY the changed files
+      - name: Download Changed Files
+        run: |
+          cd chromium_temp
+          
+          # List files changed in the last 24 hours
+          # --diff-filter=ACMRT excludes Deleted files (D) so we don't try to download them
+          git log --since="24 hours ago" --pretty="" --name-only --diff-filter=ACMRT upstream/main | sort -u > changed_files_list.txt
+          
+          COUNT=$(wc -l < changed_files_list.txt)
+          echo "Found $COUNT files changed in the last 24 hours."
+          
+          if [ "$COUNT" -eq "0" ]; then
+            echo "No changes found. Exiting."
+            echo "NO_CHANGES=true" >> $GITHUB_ENV
+            exit 0
+          fi
+
+          # Use 'git restore' to download the blobs for ONLY these specific files
+          # This triggers the lazy-download for just the files we need
+          git restore --source=upstream/main --pathspec-from-file=changed_files_list.txt .
+
+      # 4. Move files to the main repo area
+      - name: Prepare Staging Area
+        if: env.NO_CHANGES != 'true'
+        run: |
+          # Clean the current directory (remove old files from previous runs)
+          # We want the repo to contain ONLY today's changes
+          find . -maxdepth 1 -not -name '.git' -not -name '.github' -not -name 'chromium_temp' -exec rm -rf {} +
+          
+          # Move the downloaded files from temp to root
+          # We use rsync to handle directory structures correctly
+          rsync -av --exclude='.git' chromium_temp/ .
+          
+          # Cleanup temp
+          rm -rf chromium_temp
+
+      # 5. Force Push without history
+      - name: Push to Repository
+        if: env.NO_CHANGES != 'true'
+        run: |
+          git config --global user.name "Chromium Diff Bot"
+          git config --global user.email "bot@example.com"
+
+          # Switch to an orphan branch (no history)
+          git checkout --orphan latest-changes
+
+          # Add the new files
+          git add -A
+
+          git commit -m "Chromium changes for $(date +'%Y-%m-%d')"
+
+          # Force push to main, overwriting history
+          git push origin latest-changes:main --force
