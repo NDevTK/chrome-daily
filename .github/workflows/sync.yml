@@ -20,50 +20,47 @@ jobs:
           git init
           git remote add upstream https://chromium.googlesource.com/chromium/src.git
           
-          # Fetch 48 hours to ensure a valid history graph
+          # Fetch 48 hours to ensure we have a valid 'before' commit
           git fetch upstream main --filter=blob:none --shallow-since="48 hours ago"
 
-      - name: Identify and Download Changed Files
+      - name: Download Changed Files (Fast Method)
         run: |
           cd chromium_temp
           
-          # 1. Get raw list of all files touched in the last 24 hours
-          git log --since="24 hours ago" --pretty="" --name-only --diff-filter=ACMRT upstream/main | sort -u > raw_changes.txt
+          # 1. Find the commit SHA closest to 24 hours ago
+          # This gives us a precise starting point for our diff
+          START_SHA=$(git rev-list -n 1 --before="24 hours ago" upstream/main)
           
-          echo "Raw changed files count: $(wc -l < raw_changes.txt)"
-          
-          if [ ! -s raw_changes.txt ]; then
-            echo "No changes found. Exiting."
-            echo "NO_CHANGES=true" >> $GITHUB_ENV
-            exit 0
+          if [ -z "$START_SHA" ]; then
+             echo "Could not find a commit older than 24h (history too shallow?). using oldest available."
+             START_SHA=$(git rev-list --max-parents=0 HEAD)
           fi
+          echo "Comparing upstream/main against commit: $START_SHA"
+
+          # 2. Generate list using git diff (Instant)
+          # -z: Use NULL separators (handles spaces/weird chars safely)
+          # --name-only: filenames only
+          # --diff-filter=ACMRT: Exclude deleted (D) files automatically
+          git diff -z --name-only --diff-filter=ACMRT "$START_SHA" upstream/main > changed_files.txt
           
-          # 2. FILTER: Keep only files that actually exist in upstream/main
-          # We use xargs to pass the filenames to git ls-tree.
-          # git ls-tree only outputs files that exist, effectively filtering out the deleted ones.
-          # We use -r to recurse (though valid paths shouldn't need it, it's safer) and --name-only.
-          
-          cat raw_changes.txt | xargs -d '\n' git ls-tree -r --name-only upstream/main > valid_files.txt
-          
-          VALID_COUNT=$(wc -l < valid_files.txt)
-          echo "Files valid for download: $VALID_COUNT"
-          
-          if [ "$VALID_COUNT" -eq "0" ]; then
-             echo "All changed files were deleted. Nothing to download."
+          # Check if file is empty (byte count)
+          if [ ! -s changed_files.txt ]; then
+             echo "No net changes found in the last 24h."
              echo "NO_CHANGES=true" >> $GITHUB_ENV
              exit 0
           fi
 
-          # 3. Download only the verified existing files
-          git restore --source=upstream/main --pathspec-from-file=valid_files.txt
+          # 3. Download the files
+          # --pathspec-file-nul: Tells git to read the NULL-separated list we just made
+          git restore --source=upstream/main --pathspec-from-file=changed_files.txt --pathspec-file-nul .
 
       - name: Prepare Staging Area
         if: env.NO_CHANGES != 'true'
         run: |
-          # Clean current directory (remove yesterday's files)
+          # Wipe current repo (except git internals)
           find . -maxdepth 1 -not -name '.git' -not -name '.github' -not -name 'chromium_temp' -exec rm -rf {} +
           
-          # Move new files
+          # Move files
           rsync -av --exclude='.git' chromium_temp/ .
           rm -rf chromium_temp
 
